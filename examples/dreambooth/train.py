@@ -20,12 +20,13 @@ import copy
 import logging
 import math
 import os
+import json
 import warnings
 from pathlib import Path
 
 import numpy as np
 import transformers
-from peft import LoraConfig
+from peft import LoraConfig, get_peft_model
 from peft.utils import get_peft_model_state_dict
 from PIL import Image
 from PIL.ImageOps import exif_transpose
@@ -40,12 +41,16 @@ from JDiffusion import (
     AutoencoderKL,
     UNet2DConditionModel,
 )
-from diffusers import DDPMScheduler
+from JDiffusion.pipelines import StableDiffusionPipeline
+
+from diffusers import DDPMScheduler, DDIMScheduler
 from diffusers.loaders import LoraLoaderMixin
 from diffusers.optimization import get_scheduler
 from diffusers.utils import (
-    convert_state_dict_to_diffusers,
+    convert_state_dict_to_diffusers, make_image_grid
 )
+
+from transformers import CLIPImageProcessor
 
 def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
     text_encoder_config = PretrainedConfig.from_pretrained(
@@ -268,6 +273,38 @@ def parse_args(input_args=None):
         help=("The dimension of the LoRA update matrices."),
     )
 
+    parser.add_argument(
+        "--text_learning_rate",
+        type=float,
+        default=5e-4,
+        help="Initial learning rate (after the potential warmup period) to use.",
+    )
+    parser.add_argument(
+        "--text_rank",
+        type=int,
+        default=0,
+        help=("The dimension of the LoRA update matrices."),
+    )
+    
+    parser.add_argument(
+        "--caption_path",
+        type=str,
+        default=None,
+    )
+    
+    parser.add_argument(
+        "--eval_every_steps",
+        type=int,
+        default=0,
+    )
+    parser.add_argument(
+        "--eval_prompts_path",
+        type=str,
+        default=None,
+    )
+    
+    
+
     if input_args is not None:
         args = parser.parse_args(input_args)
     else:
@@ -279,6 +316,7 @@ def parse_args(input_args=None):
     if args.class_prompt is not None:
         warnings.warn("You need not use --class_prompt without --with_prior_preservation.")
 
+    args.train_text_encoder = args.text_rank > 0
     return args
 
 
@@ -301,6 +339,8 @@ class DreamBoothDataset(Dataset):
         encoder_hidden_states=None,
         class_prompt_encoder_hidden_states=None,
         tokenizer_max_length=None,
+        
+        caption_path=None,
     ):
         self.size = size
         self.center_crop = center_crop
@@ -339,6 +379,12 @@ class DreamBoothDataset(Dataset):
                 transform.ImageNormalize([0.5], [0.5]),
             ]
         )
+        
+        if caption_path is not None:
+            with open(caption_path, 'r') as f:
+                self.captions = json.load(f)
+        else:
+            self.captions = None
 
     def __len__(self):
         return self._length
@@ -355,8 +401,15 @@ class DreamBoothDataset(Dataset):
         if self.encoder_hidden_states is not None:
             example["instance_prompt_ids"] = self.encoder_hidden_states
         else:
+            # instance_prompt = self.instance_prompt # 0
+            # instance_prompt = self.instance_images_path[index % self.num_instance_images].stem + ", " + self.instance_prompt # 0.1
+            # instance_prompt = "an artwork in style sks depicting " + self.instance_images_path[index % self.num_instance_images].stem + " with material and texture of style sks" # 1
+            # instance_prompt = "an artwork in style sks depicting " + self.instance_images_path[index % self.num_instance_images].stem + " with material and texture of style rcn" # 1.1
+            # instance_prompt = "one " + self.instance_images_path[index % self.num_instance_images].stem + " depicted in artwork style sks" # 1.2
+            # instance_prompt = self.captions[self.instance_images_path[index % self.num_instance_images].stem] + " Depicted in style rcn." # 2
+            instance_prompt = "nlwx " + self.captions[self.instance_images_path[index % self.num_instance_images].stem] # 2.1
             text_inputs = tokenize_prompt(
-                self.tokenizer, self.instance_prompt, tokenizer_max_length=self.tokenizer_max_length
+                self.tokenizer, instance_prompt, tokenizer_max_length=self.tokenizer_max_length
             )
             example["instance_prompt_ids"] = text_inputs.input_ids
             example["instance_attention_mask"] = text_inputs.attention_mask
@@ -428,7 +481,6 @@ def tokenize_prompt(tokenizer, prompt, tokenizer_max_length=None):
         max_length = tokenizer_max_length
     else:
         max_length = tokenizer.model_max_length
-
     text_inputs = tokenizer(
         prompt,
         truncation=True,
@@ -499,6 +551,8 @@ def main(args):
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
     )
+    
+
 
     # We only train the additional adapter LoRA layers
    #if vae is not None:
@@ -517,14 +571,35 @@ def main(args):
         r=args.rank,
         lora_alpha=args.rank,
         init_lora_weights="gaussian",
-        target_modules=["to_k", "to_q", "to_v", "to_out.0", "add_k_proj", "add_v_proj"],
+        # target_modules=["to_k", "to_q", "to_v", "to_out.0", "add_k_proj", "add_v_proj"],
+        target_modules=["attn1.to_k", "attn1.to_q", "attn1.to_v", "attn1.to_out.0", "attn2.to_k", "attn2.to_q", "attn2.to_v", "attn2.to_out.0", "ff.net.0.proj", "ff.net.2", "proj_in", "proj_out"],
     )
     unet.add_adapter(unet_lora_config)
+    
+    for name, param in text_encoder.named_parameters():
+        assert param.requires_grad == False, name
+    if args.train_text_encoder:
+        text_encoder_lora_config = LoraConfig(
+            r=args.text_rank,
+            lora_alpha=args.text_rank,
+            init_lora_weights="gaussian",
+            target_modules=["q_proj", "k_proj", "v_proj", "out_proj"], # "fc1", "fc2"
+        )
+        text_encoder = get_peft_model(text_encoder, text_encoder_lora_config)
 
     # Optimizer creation
 
+    # optimizer = AdamW(
+    #     list(unet.parameters()),
+    #     lr=args.learning_rate,
+    #     betas=(args.adam_beta1, args.adam_beta2),
+    #     weight_decay=args.adam_weight_decay,
+    #     eps=args.adam_epsilon,
+    # )
+    
     optimizer = AdamW(
-        list(unet.parameters()),
+        params=[{'params': list(unet.parameters()), 'lr': args.learning_rate}] + \
+            ([{'params': list(text_encoder.parameters()), 'lr': args.text_learning_rate}] if args.train_text_encoder else []),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -547,6 +622,7 @@ def main(args):
         encoder_hidden_states=pre_computed_encoder_hidden_states,
         class_prompt_encoder_hidden_states=pre_computed_class_prompt_encoder_hidden_states,
         tokenizer_max_length=args.tokenizer_max_length,
+        caption_path=args.caption_path,
     )
 
     train_dataloader = DataLoader(
@@ -596,6 +672,9 @@ def main(args):
     print(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     print(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     print(f"  Total optimization steps = {args.max_train_steps}")
+    print(f"  UNet lr = {args.learning_rate}")
+    if args.train_text_encoder:
+        print(f"  Text Ecoder lr = {args.text_learning_rate}")
     global_step = 0
     first_epoch = 0
 
@@ -608,7 +687,11 @@ def main(args):
         # Only show the progress bar once on each machine.
         disable=False,
     )
-
+    
+    if args.eval_every_steps > 0:
+        with open(args.eval_prompts_path, "r") as file:
+            eval_prompts = json.load(file)
+    
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
@@ -682,6 +765,31 @@ def main(args):
             logs = {"loss": loss.detach().item()}
             #logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
+            
+            if args.eval_every_steps > 0 and global_step % args.eval_every_steps == 0:
+                with jt.no_grad():
+                    import time
+                    time.sleep(3)
+                    pipe = StableDiffusionPipeline(vae=vae, text_encoder=text_encoder, tokenizer=tokenizer, unet=unet, scheduler=DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder='scheduler'), safety_checker=None, feature_extractor=None).to("cuda")
+                    # pipe.text_encoder = text_encoder
+                    # pipe.unet = unet
+                    images = []
+                    for id, prompt in eval_prompts.items():
+                        # print(prompt)
+                        # myprompt = prompt + f" in style_{taskid}" # 0
+                        # myprompt = prompt + f", style_{taskid}" # 0.1
+                        # myprompt = "an artwork in style sks depicting " + prompt.lower() + " with material and texture of style sks" # 1
+                        # myprompt = "an artwork in style sks depicting " + prompt.lower() + " with material and texture of style rcn" # 1.1
+                        # myprompt = "one " + prompt.lower() + " depicted in artwork style sks" # 1.2
+                        # myprompt = prompt.lower() + ". Depicted in style rcn." # 2
+                        myprompt = "nlwx " +  prompt.lower() # 2.1
+                        image = pipe(myprompt, num_inference_steps=25, width=512, height=512).images[0]
+                        image = image.resize((128, 128))
+                        images.append(image)
+                    image_grid = make_image_grid(images, rows=5, cols=5)
+                    samples_dir = os.path.join(args.output_dir, "samples")
+                    os.makedirs(samples_dir, exist_ok=True)
+                    image_grid.save(f"{samples_dir}/{global_step}.png")
 
             if global_step >= args.max_train_steps:
                 break
@@ -689,8 +797,11 @@ def main(args):
     # Save the lora layers
     unet = unet.to(jt.float32)
     unet_lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unet))
-
+    
     text_encoder_state_dict = None
+    if args.train_text_encoder:
+        text_encoder = text_encoder.to(jt.float32)
+        text_encoder_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(text_encoder.base_model.model))
     LoraLoaderMixin.save_lora_weights(
         save_directory=args.output_dir,
         unet_lora_layers=unet_lora_state_dict,
